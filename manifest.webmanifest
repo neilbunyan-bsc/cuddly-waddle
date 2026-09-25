@@ -1,0 +1,13 @@
+{
+  "name": "Steady Strong",
+  "short_name": "Steady Strong",
+  "description": "Short, autoregulated strength and cardio training for a strong heart and a long life.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#101418",
+  "theme_color": "#101418",
+  "icons": [
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

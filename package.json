@@ -1,0 +1,11 @@
+{
+  "name": "steady-strong",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Short, autoregulated strength + cardio training for a healthy, strong, long life.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "start": "python3 -m http.server 8080"
+  }
+}
