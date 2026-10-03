@@ -1,19 +1,27 @@
 // The training engine: builds sessions, adjusts them live, and learns from
 // what you log. Everything here is pure data in, data out, so it can be
 // unit tested without a browser.
-import { estimate1RM, loadFor } from './rpe.js';
+import { estimate1RM, loadFor, percentOf1RM } from './rpe.js';
 import { roundBarbell, roundTo, warmupSets, UNIT_CONFIG } from './loads.js';
 import {
-  MAIN_LIFTS, ACCESSORIES, BLOCKS, TEMPLATES, DELOAD, DELOAD_SECONDARY,
-  WEEKS_PER_BLOCK, blockTypeFor,
+  MAIN_LIFTS, ACCESSORIES, ACCESSORY_POOLS, BLOCKS, TEMPLATES, DELOAD, DELOAD_SECONDARY,
+  WEEKS_PER_BLOCK, blockTypeFor, pickAccessory, accessoryCategory,
 } from './library.js';
-import { buildCardioSession, progressCardio, INTERVAL_LADDER } from './cardio.js';
+import { buildCardioSession, progressCardio, heartRateZones, INTERVAL_LADDER } from './cardio.js';
 
-export const STATE_VERSION = 1;
+export const STATE_VERSION = 2;
 const MAIN_REST = 150;
 const SECONDARY_REST = 120;
 const ACCESSORY_REST = 60;
 const BREAK_DAYS = 14;
+// Once a lift is at its weight cap, reps climb instead, up to this ceiling.
+// Deadlifts stop lower because high-rep deadlifts get sloppy.
+export const MAX_REPS_AT_CAP = { squat: 12, bench: 12, deadlift: 10, press: 12 };
+
+export const DEFAULT_CAPS = {
+  lb: { squat: 315, bench: 225, deadlift: 405, press: 135 },
+  kg: { squat: 142.5, bench: 102.5, deadlift: 182.5, press: 60 },
+};
 
 // ---------------------------------------------------------------------------
 // Setup
@@ -23,10 +31,12 @@ export function defaultProfile() {
     units: 'lb',
     age: 40,
     liftDays: 3,
-    cardioDays: 2,
+    cardioDays: 3,
     length: 'standard',
     z2Start: 25,
-    z2Max: 45,
+    z2Max: 60,
+    finisher: 10,
+    caps: { ...DEFAULT_CAPS.lb },
   };
 }
 
@@ -41,11 +51,7 @@ export function createState(profile, liftInputs, now = new Date()) {
     lifts[key] = { e1rm, strikes: 0, history: [{ date: now.toISOString(), e1rm }] };
   }
   const accessories = {};
-  for (const [key, acc] of Object.entries(ACCESSORIES)) {
-    accessories[key] = acc.loaded
-      ? { weight: acc.start[profile.units] }
-      : { target: acc.range[0] };
-  }
+  fillAccessories(accessories, profile.units);
   return {
     version: STATE_VERSION,
     createdAt: now.toISOString(),
@@ -57,6 +63,44 @@ export function createState(profile, liftInputs, now = new Date()) {
     history: [],
     active: null,
   };
+}
+
+function fillAccessories(accessories, units) {
+  for (const [key, acc] of Object.entries(ACCESSORIES)) {
+    if (accessories[key]) continue;
+    accessories[key] = acc.loaded ? { weight: acc.start[units] } : { target: acc.range[0] };
+  }
+}
+
+// Bring saved data from older versions up to date.
+export function migrateState(saved) {
+  if (!saved) return saved;
+  const s = structuredClone(saved);
+  const p = s.profile;
+  if (!p.caps) p.caps = { ...DEFAULT_CAPS[p.units] };
+  if (p.finisher == null) p.finisher = 10;
+  if ((s.version ?? 1) < 2 && p.z2Max === 45) p.z2Max = 60;
+  fillAccessories(s.accessories, p.units);
+  // An in-progress workout from an older version may reference removed exercises.
+  if ((s.version ?? 1) < 2) s.active = null;
+  s.version = STATE_VERSION;
+  return s;
+}
+
+// The cap for a lift, snapped down to loadable plates. null = no cap.
+export function capFor(profile, lift) {
+  const cap = Number(profile.caps?.[lift]);
+  if (!(cap > 0)) return null;
+  const step = UNIT_CONFIG[profile.units].step;
+  return Math.floor(cap / step + 1e-9) * step;
+}
+
+// Most reps (between minReps and maxReps) you can do at `load` and stay at
+// or under the target RPE, given an estimated max.
+export function repsAtLoad(e1rm, load, rpe, minReps, maxReps) {
+  let r = minReps;
+  while (r < maxReps && e1rm * percentOf1RM(r + 1, rpe) >= load) r += 1;
+  return r;
 }
 
 function defaultE1RM(lift, units) {
@@ -71,7 +115,9 @@ function cardioKinds(count, week) {
   if (count <= 0) return [];
   if (count === 1) return [week % 2 === 0 ? 'intervals' : 'z2'];
   if (count === 2) return ['z2', 'intervals'];
-  return ['z2', 'intervals', 'z2'];
+  if (count === 3) return ['z2', 'intervals', 'z2'];
+  if (count === 4) return ['z2', 'intervals', 'z2', 'z2'];
+  return ['z2', 'intervals', 'z2', 'intervals', 'z2'];
 }
 
 // Interleave lifting and cardio: lift, cardio, lift, cardio, ...
@@ -164,25 +210,46 @@ export function buildSession(state, slot = currentSlot(state), { readiness = 'no
   const backoffRpe = topRpe - 1;
   const backoffCount = Math.max(0, (info.deload ? 1 : 2) - (short ? 1 : 0) - (low ? 1 : 0));
   const e1rm = lifts[tpl.main].e1rm;
-  const topWeight = roundBarbell(loadFor(e1rm, wave.reps, topRpe), units);
-  const backoffWeight = Math.min(topWeight, roundBarbell(loadFor(e1rm, wave.reps, backoffRpe), units));
+  const cap = capFor(profile, tpl.main);
+  let reps = wave.reps;
+  let topWeight = roundBarbell(loadFor(e1rm, reps, topRpe), units);
+  let capped = false;
+  if (info.deload) {
+    const peak = BLOCKS[info.type].weeks[WEEKS_PER_BLOCK - 2];
+    const peakWeight = Math.min(loadFor(e1rm, peak.reps, peak.rpe), cap ?? Infinity);
+    topWeight = roundBarbell(peakWeight * DELOAD.scale, units);
+  } else if (cap && topWeight >= cap) {
+    // At the cap: hold the weight and earn progress as extra reps.
+    capped = true;
+    topWeight = cap;
+    reps = repsAtLoad(e1rm, cap, topRpe, wave.reps, MAX_REPS_AT_CAP[tpl.main]);
+  }
+  const backoffWeight = info.deload
+    ? roundBarbell(topWeight * 0.9, units)
+    : Math.min(topWeight, roundBarbell(loadFor(e1rm, reps, backoffRpe), units));
   exercises.push({
     role: 'main',
     lift: tpl.main,
     name: MAIN_LIFTS[tpl.main].name,
     rest: MAIN_REST,
+    capped,
+    cap,
     warmup: warmupSets(topWeight, units),
     sets: [
-      { type: 'top', weight: topWeight, reps: wave.reps, rpe: topRpe },
-      ...Array.from({ length: backoffCount }, () => ({ type: 'backoff', weight: backoffWeight, reps: wave.reps, rpe: backoffRpe })),
+      { type: 'top', weight: topWeight, reps, rpe: topRpe },
+      ...Array.from({ length: backoffCount }, () => ({ type: 'backoff', weight: backoffWeight, reps, rpe: backoffRpe })),
     ],
   });
 
   if (tpl.secondary) {
     const sec = info.deload ? DELOAD_SECONDARY : BLOCKS[info.type].secondary;
     const rpe = sec.rpe - (low ? 1 : 0);
-    const count = Math.max(2, 3 - (short ? 1 : 0) - (low || info.deload ? 1 : 0));
-    const weight = roundBarbell(loadFor(lifts[tpl.secondary].e1rm, sec.reps, rpe), units);
+    // With a cardio finisher, trim lifting volume so the whole session stays short.
+    const trim = short || low || info.deload || profile.finisher > 0;
+    const count = trim ? 2 : 3;
+    const secCap = capFor(profile, tpl.secondary);
+    let weight = roundBarbell(loadFor(lifts[tpl.secondary].e1rm, sec.reps, rpe), units);
+    if (secCap) weight = Math.min(weight, secCap);
     exercises.push({
       role: 'secondary',
       lift: tpl.secondary,
@@ -192,27 +259,21 @@ export function buildSession(state, slot = currentSlot(state), { readiness = 'no
     });
   }
 
-  const accKeys = tpl.accessories.slice(0, short ? 2 : 3);
-  const accSets = short || low || info.deload ? 2 : 3;
-  for (const key of accKeys) {
-    const def = ACCESSORIES[key];
-    const st = accessories[key];
+  const accSets = short || low || info.deload || profile.finisher > 0 ? 2 : 3;
+  for (const category of tpl.accessories.slice(0, short ? 2 : 3)) {
+    exercises.push(accessoryExercise(state, pickAccessory(category, cursor.block, slot.day), accSets));
+  }
+
+  if (profile.finisher > 0) {
+    const z = heartRateZones(profile.age).z2;
     exercises.push({
-      role: 'accessory',
-      acc: key,
-      name: def.name,
-      note: def.note || '',
-      unit: def.unit || 'reps',
-      loaded: def.loaded,
-      range: def.range,
-      rest: ACCESSORY_REST,
-      sets: Array.from({ length: accSets }, () => ({
-        type: 'acc',
-        weight: def.loaded ? st.weight : null,
-        reps: def.loaded ? def.range[1] : st.target,
-        min: def.loaded ? def.range[0] : st.target,
-        rpe: 8,
-      })),
+      role: 'finisher',
+      name: 'Easy cardio finisher',
+      note: `Bike, rower or incline walk at ${z[0]}-${z[1]} bpm. Log the minutes you did.`,
+      unit: 'min',
+      loaded: false,
+      rest: 0,
+      sets: [{ type: 'finisher', weight: null, reps: profile.finisher, min: profile.finisher, rpe: null }],
     });
   }
 
@@ -226,6 +287,52 @@ export function buildSession(state, slot = currentSlot(state), { readiness = 'no
   };
 }
 
+export function accessoryExercise(state, key, setCount) {
+  const def = ACCESSORIES[key];
+  const st = state.accessories[key];
+  return {
+    role: 'accessory',
+    acc: key,
+    category: accessoryCategory(key),
+    name: def.name,
+    note: def.note || '',
+    unit: def.unit || 'reps',
+    loaded: def.loaded,
+    range: def.range,
+    rest: ACCESSORY_REST,
+    sets: Array.from({ length: setCount }, () => ({
+      type: 'acc',
+      weight: def.loaded ? st.weight : null,
+      reps: def.loaded ? def.range[1] : st.target,
+      min: def.loaded ? def.range[0] : st.target,
+      rpe: 8,
+    })),
+  };
+}
+
+// Swap an accessory for the next exercise in its category (equipment taken,
+// or just want something different today). Returns the new exercise or null.
+export function swapAccessory(state, session, exIdx) {
+  const ex = session.exercises[exIdx];
+  const pool = ACCESSORY_POOLS[ex.category] || [];
+  const inUse = new Set(session.exercises.map((e) => e.acc));
+  const start = pool.indexOf(ex.acc);
+  for (let k = 1; k < pool.length; k++) {
+    const key = pool[(start + k) % pool.length];
+    if (!inUse.has(key)) return accessoryExercise(state, key, ex.sets.length);
+  }
+  return null;
+}
+
+// Accessories in use for a given block (for the progress screen).
+export function accessoriesForBlock(profile, blockIndex) {
+  const keys = new Set();
+  TEMPLATES[profile.liftDays].forEach((tpl, day) => {
+    tpl.accessories.forEach((c) => keys.add(pickAccessory(c, blockIndex, day)));
+  });
+  return [...keys];
+}
+
 function estimateMinutes(exercises) {
   let total = 4; // general warm-up
   let accessoryCount = 0;
@@ -233,6 +340,7 @@ function estimateMinutes(exercises) {
   for (const ex of exercises) {
     if (ex.role === 'main') total += ex.warmup.length * 1.25 + ex.sets.length * (1 + ex.rest / 60);
     else if (ex.role === 'secondary') total += 2 + ex.sets.length * (1 + ex.rest / 60);
+    else if (ex.role === 'finisher') total += ex.sets[0].reps;
     else {
       accessoryCount += 1;
       accessorySets = ex.sets.length;
@@ -263,7 +371,7 @@ export function adjustAfterSet(session, log, exIdx, setIdx, units) {
   const ex = session.exercises[exIdx];
   const planned = ex.sets[setIdx];
   const actual = log.exercises[exIdx].sets[setIdx];
-  if (!actual) return null;
+  if (!actual || ex.role === 'finisher') return null;
   const remaining = ex.sets
     .map((s, i) => ({ s, i }))
     .filter(({ i }) => i > setIdx && !log.exercises[exIdx].sets[i]);
@@ -364,9 +472,21 @@ function updateMainLift(lift, ex, exLog, deload, units) {
     strikes = 0;
     reason = 'two tough sessions running, so a 5% reset to rebuild momentum';
   }
+
+  // At the weight cap, progress is measured in reps, so report it that way.
+  let atCap = lift.atCap || null;
+  let note = `${name}: est. max ${fmt(prev)} → ${fmt(next)} (${reason}).`;
+  if (ex.cap && top.actual.weight >= ex.cap) {
+    const best = atCap && atCap.weight === ex.cap ? atCap.reps : 0;
+    note = `${name}: ${top.actual.reps} reps at your ${ex.cap} cap (${reason}).`;
+    if (top.actual.reps > best) {
+      atCap = { weight: ex.cap, reps: top.actual.reps };
+      if (best) note = `${name}: new rep record at ${ex.cap}, ${top.actual.reps} reps (was ${best}). ${reason[0].toUpperCase()}${reason.slice(1)}.`;
+    }
+  }
   return {
-    lift: { ...lift, e1rm: next, strikes },
-    note: `${name}: est. max ${fmt(prev)} → ${fmt(next)} (${reason}).`,
+    lift: { ...lift, e1rm: next, strikes, atCap },
+    note,
   };
 }
 
@@ -427,7 +547,7 @@ export function completeSession(state, session, log, { now = new Date(), skipped
         if (note) notes.push(note);
       } else if (ex.role === 'secondary') {
         next.lifts[ex.lift] = updateSecondaryLift(next.lifts[ex.lift], ex, exLog, session.deload);
-      } else {
+      } else if (ex.role === 'accessory') {
         const { st, note } = updateAccessory(ex.acc, next.accessories[ex.acc], ex, exLog, units);
         next.accessories[ex.acc] = st;
         if (note) notes.push(note);
@@ -503,6 +623,13 @@ export function applyProfileChange(state, profile) {
     for (const lift of Object.values(next.lifts)) lift.e1rm *= f;
     for (const acc of Object.values(next.accessories)) {
       if (acc.weight != null) acc.weight = roundTo(acc.weight * f, step);
+    }
+    if (!profile.caps && next.profile.caps) {
+      const barStep = UNIT_CONFIG[profile.units].step;
+      for (const k of Object.keys(next.profile.caps)) {
+        const c = Number(next.profile.caps[k]);
+        next.profile.caps[k] = c > 0 ? roundTo(c * f, barStep) : c;
+      }
     }
   }
   next.profile = { ...next.profile, ...profile };

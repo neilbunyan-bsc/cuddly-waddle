@@ -15,11 +15,13 @@ and a long life, not a meet total.
 
 | Piece | What it does |
 | --- | --- |
-| **4-week blocks** | 3 weeks that get heavier, then 1 lighter deload week. Blocks alternate between **Build** (8→7→6 reps) and **Strength** (5→4→3 reps). |
+| **4-week blocks** | 3 weeks that get heavier, then 1 lighter deload week. Blocks alternate between **Build** (10→9→8 reps) and **Strength** (6→5→4 reps). |
+| **Weight limits** | Set the heaviest you want to lift for each lift (defaults: squat 315, bench 225, deadlift 405, press 135 lb). At a limit, the weight holds and the target reps climb instead, up to 12 (10 for deadlifts). Rep records at each limit are tracked. |
 | **Main lift** | One top set at a target RPE (never above 8.5), then 1-2 back-off sets about 1 RPE lighter. Includes an automatic warm-up ramp. |
 | **Volume lift** | Easy sets (RPE 6.5) of a second big lift for practice. |
-| **Accessories** | 2-3 movements for health and longevity (rows, pull-ups, split squats, carries, planks, face pulls). Do them as supersets. They use double progression: hit the top of the rep range on every set and the weight goes up. |
-| **Zone 2 cardio** | Easy, conversational work. It grows 5 minutes per session you complete easily, up to your cap (45 min by default). |
+| **Accessories** | 2-3 movements per session from groups like rows, pull-ups, single-leg work, hinges, upper back, pressing, arms and grip. The exercise in each group rotates every 4-week block, and **Swap** picks another one for today. No direct core work, because heavy squats and deadlifts cover it. They use double progression: hit the top of the rep range on every set and the weight goes up. Weights are remembered for when an exercise rotates back. |
+| **Cardio finisher** | Optional 10-20 min of easy cardio at the end of each lifting day. When it's on, accessory and volume sets drop to 2 so the session stays around 45-50 minutes. |
+| **Zone 2 cardio** | Easy, conversational work, 0-5 days a week. It grows 5 minutes per session you complete easily, up to your cap (60 min by default). |
 | **Interval cardio** | Climbs a ladder from 5 × 1 min up to the 4×4 protocol (4 min hard, 3 min easy), then holds there. |
 
 ### Adjusting to you

@@ -4,7 +4,7 @@ import { load, save, exportFile, importFile } from './storage.js';
 const $app = document.getElementById('app');
 const $nav = document.getElementById('nav');
 
-let state = load();
+let state = E.migrateState(load());
 let tab = 'today';
 const ui = {
   stage: null, // null | 'readiness'
@@ -106,8 +106,9 @@ function setupView(p = E.defaultProfile()) {
       <label>Units<select name="units"><option value="lb">lb</option><option value="kg">kg</option></select></label>
       <label>Age<input type="number" name="age" value="${p.age}" min="14" max="90" inputmode="numeric" required></label>
       <label>Lifting days / week<select name="liftDays">${[2, 3, 4].map((d) => `<option ${d === p.liftDays ? 'selected' : ''}>${d}</option>`).join('')}</select></label>
-      <label>Cardio days / week<select name="cardioDays">${[0, 1, 2, 3].map((d) => `<option ${d === p.cardioDays ? 'selected' : ''}>${d}</option>`).join('')}</select></label>
+      <label>Cardio days / week<select name="cardioDays">${[0, 1, 2, 3, 4, 5].map((d) => `<option ${d === p.cardioDays ? 'selected' : ''}>${d}</option>`).join('')}</select></label>
       <label>Session length<select name="length"><option value="standard">Standard (~45 min)</option><option value="short">Short (~30 min)</option></select></label>
+      <label>Cardio after lifting<select name="finisher">${finisherOptions(p.finisher)}</select></label>
       <label>Current easy cardio (min)<input type="number" name="z2Start" value="${p.z2Start}" min="10" max="60" step="5" inputmode="numeric"></label>
     </div>
     <h2>A recent set for each lift</h2>
@@ -116,9 +117,29 @@ function setupView(p = E.defaultProfile()) {
     ${liftRow('bench', 'Bench Press', 135, 5)}
     ${liftRow('deadlift', 'Deadlift', 225, 5)}
     ${liftRow('press', 'Overhead Press', 95, 5)}
+    <h2>Weight limits</h2>
+    <p class="muted">The heaviest you want to lift. Once a lift gets there, the weight stays put and you work on getting more reps instead. Leave blank for no limit.</p>
+    ${capInputs(p.caps)}
     <button class="primary big" type="submit">Build my plan</button>
     <label class="linklike">Restore from backup<input type="file" accept="application/json" data-action="import" hidden></label>
   </form>`;
+}
+
+function finisherOptions(cur) {
+  return [0, 10, 15, 20].map((m) => `<option value="${m}" ${m === Number(cur) ? 'selected' : ''}>${m ? `${m} min easy` : 'None'}</option>`).join('');
+}
+
+function capInputs(caps = {}) {
+  return `<div class="grid2">${Object.entries(E.MAIN_LIFTS).map(([k, d]) => `<label>${esc(d.name)}<input type="number" inputmode="decimal" step="any" min="0" name="cap-${k}" value="${caps[k] ?? ''}" placeholder="No limit"></label>`).join('')}</div>`;
+}
+
+function readCaps(f) {
+  const caps = {};
+  for (const k of Object.keys(E.MAIN_LIFTS)) {
+    const v = Number(f.get(`cap-${k}`));
+    caps[k] = v > 0 ? v : null;
+  }
+  return caps;
 }
 
 // ---------- Today
@@ -166,9 +187,11 @@ function sessionPreview(s) {
     let detail;
     if (ex.role === 'main') {
       const bo = ex.sets.filter((x) => x.type === 'backoff');
-      detail = `${fmtW(first.weight)} × ${first.reps} @ RPE ${first.rpe}${bo.length ? `, then ${bo.length} × ${bo[0].reps} @ ${fmtW(bo[0].weight)}` : ''}`;
+      detail = `${ex.capped ? 'Cap: ' : ''}${fmtW(first.weight)} × ${first.reps} @ RPE ${first.rpe}${bo.length ? `, then ${bo.length} × ${bo[0].reps} @ ${fmtW(bo[0].weight)}` : ''}`;
     } else if (ex.role === 'secondary') {
       detail = `${ex.sets.length} × ${first.reps} @ ${fmtW(first.weight)}`;
+    } else if (ex.role === 'finisher') {
+      detail = `${first.reps} min easy`;
     } else {
       detail = accessoryTarget(ex, first);
     }
@@ -176,8 +199,10 @@ function sessionPreview(s) {
   }).join('')}</ul>`;
 }
 
+const unitSuffix = (ex) => ({ sec: 's', min: ' min' }[ex.unit] || '');
+
 function accessoryTarget(ex, set) {
-  const u = ex.unit === 'sec' ? 's' : '';
+  const u = unitSuffix(ex);
   const reps = ex.loaded ? `${ex.range[0]}-${ex.range[1]}${u}` : `${set.reps}${u}`;
   return `${ex.sets.length} × ${reps}${ex.loaded ? ` @ ${fmtW(set.weight)}` : ''}`;
 }
@@ -230,21 +255,31 @@ function activeView() {
 
 function liftActive() {
   const { session, log } = state.active;
-  const cards = session.exercises.map((ex, i) => exerciseCard(ex, i, log.exercises[i])).join('');
+  const firstAcc = session.exercises.findIndex((ex) => ex.role === 'accessory');
+  const cards = session.exercises.map((ex, i) => {
+    // Accessories pair up: 1st with 2nd, 3rd on its own.
+    const pairsWithNext = ex.role === 'accessory' && (i - firstAcc) % 2 === 0 && session.exercises[i + 1]?.role === 'accessory';
+    return exerciseCard(ex, i, log.exercises[i], pairsWithNext);
+  }).join('');
   return `${cards}
   <div class="rest-bar" id="rest" hidden></div>
   <button class="primary big" data-action="finish">Finish workout</button>`;
 }
 
-function exerciseCard(ex, i, exLog) {
+function exerciseCard(ex, i, exLog, pairsWithNext) {
   const nextIdx = exLog.sets.findIndex((s, j) => !s && !ex.sets[j].optional);
-  const roleLabel = { main: 'Main lift', secondary: 'Volume', accessory: 'Accessory' }[ex.role];
-  const pairHint = ex.role === 'accessory' ? '<span class="muted small">Superset with the next accessory</span>' : '';
+  const roleLabel = { main: 'Main lift', secondary: 'Volume', accessory: 'Accessory', finisher: 'Cardio' }[ex.role];
+  const pairHint = pairsWithNext ? '<div class="muted small">Superset with the next accessory</div>' : '';
+  const anyLogged = exLog.sets.some(Boolean);
+  const swap = ex.role === 'accessory' && !anyLogged ? `<button class="ghost small" data-action="swap" data-ex="${i}">Swap</button>` : '';
+  const capNote = ex.capped ? `<div class="note cap">At your ${fmtW(ex.cap)} ${units()} limit. The weight stays here, so today is about the reps.</div>` : '';
   return `
   <section class="card exercise ${ex.role}">
     <div class="ex-head">
       <div><div class="eyebrow">${roleLabel}</div><h3>${esc(ex.name)}</h3>${ex.note ? `<div class="muted small">${esc(ex.note)}</div>` : ''}${pairHint}</div>
+      ${swap}
     </div>
+    ${capNote}
     ${ex.lastNote ? `<div class="note coach">${esc(ex.lastNote)}</div>` : ''}
     ${ex.warmup ? `<details class="warmup"><summary>Warm-up sets</summary><ul>${ex.warmup.map((w) => `<li>${fmtW(w.weight)} × ${w.reps}</li>`).join('')}</ul></details>` : ''}
     <ul class="sets">
@@ -255,10 +290,11 @@ function exerciseCard(ex, i, exLog) {
 
 function setRow(ex, planned, actual, i, j, isNext) {
   const editing = ui.editing && ui.editing.ex === i && ui.editing.set === j;
-  const u = ex.unit === 'sec' ? 's' : '';
-  const label = planned.type === 'top' ? 'Top' : planned.type === 'backoff' ? 'Back-off' : `Set ${j + 1}`;
+  const u = unitSuffix(ex);
+  const label = { top: 'Top', backoff: 'Back-off', finisher: 'Cardio' }[planned.type] || `Set ${j + 1}`;
   let target;
-  if (ex.role === 'accessory') target = `${ex.loaded ? `${fmtW(planned.weight)} × ` : ''}${ex.loaded ? `${ex.range[0]}-${ex.range[1]}` : planned.reps}${u}`;
+  if (ex.role === 'finisher') target = `${planned.reps} min easy`;
+  else if (ex.role === 'accessory') target = `${ex.loaded ? `${fmtW(planned.weight)} × ` : ''}${ex.loaded ? `${ex.range[0]}-${ex.range[1]}` : planned.reps}${u}`;
   else target = `${fmtW(planned.weight)} × ${planned.reps} @ ${planned.rpe}`;
   if (editing) return `<li class="set editing">${setEditor(ex, planned, actual, i, j, label)}</li>`;
   if (actual) {
@@ -274,7 +310,8 @@ function setEditor(ex, planned, actual, i, j, label) {
   const cur = actual || { weight: planned.weight, reps: planned.reps, rpe: planned.rpe };
   const step = ex.role === 'accessory' ? E.UNIT_CONFIG[units()].accessoryStep : E.UNIT_CONFIG[units()].step;
   const repStep = ex.unit === 'sec' ? 5 : 1;
-  const u = ex.unit === 'sec' ? 'Seconds' : 'Reps';
+  const u = { sec: 'Seconds', min: 'Minutes' }[ex.unit] || 'Reps';
+  const fin = ex.role === 'finisher';
   const stepper = (name, value, st, lbl) => `
     <div class="stepper">
       <span class="lbl">${lbl}</span>
@@ -284,12 +321,12 @@ function setEditor(ex, planned, actual, i, j, label) {
     </div>`;
   return `
     <div class="editor">
-      <div class="eyebrow">${label} · target ${ex.role === 'accessory' ? (ex.loaded ? `${ex.range[0]}-${ex.range[1]}` : planned.reps) : `${planned.reps} @ RPE ${planned.rpe}`}</div>
+      <div class="eyebrow">${label} · target ${fin ? `${planned.reps} min` : ex.role === 'accessory' ? (ex.loaded ? `${ex.range[0]}-${ex.range[1]}` : planned.reps) : `${planned.reps} @ RPE ${planned.rpe}`}</div>
       ${ex.loaded !== false ? stepper('weight', cur.weight, step, `Weight (${units()})`) : ''}
       ${stepper('reps', cur.reps, repStep, u)}
-      <div class="lbl">How hard? (RPE)</div>
+      ${fin ? '' : `<div class="lbl">How hard? (RPE)</div>
       <div class="chips rpe">${E.RPE_OPTIONS.map((r) => `<button type="button" class="chip ${r === cur.rpe ? 'on' : ''}" data-action="pick-rpe" data-val="${r}" title="${E.RPE_LABELS[r]}">${r}</button>`).join('')}</div>
-      <div class="muted small" id="rpe-desc">${esc(E.RPE_LABELS[cur.rpe] || '')}</div>
+      <div class="muted small" id="rpe-desc">${esc(E.RPE_LABELS[cur.rpe] || '')}</div>`}
       <input type="hidden" id="in-rpe" value="${cur.rpe ?? ''}">
       <div class="row">
         <button class="primary" data-action="log-set" data-ex="${i}" data-set="${j}">Log set</button>
@@ -371,17 +408,23 @@ function progressView() {
     const diff = l.e1rm - first;
     return `<div class="lift-stat">
       <div class="row between"><strong>${esc(def.name)}</strong><span>${fmtE1(l.e1rm)} ${units()} <span class="${diff >= 0 ? 'up' : 'down'} small">${diff >= 0 ? '+' : ''}${fmtE1(diff)}</span></span></div>
+      ${capLine(k, l)}
       ${sparkline(l.history)}
     </div>`;
   }).join('');
-  const acc = Object.entries(E.ACCESSORIES).map(([k, def]) => {
+  const acc = E.accessoriesForBlock(state.profile, state.cursor.block).map((k) => {
+    const def = E.ACCESSORIES[k];
     const st = state.accessories[k];
     const val = def.loaded ? `${fmtW(st.weight)}${st.weight ? ` ${units()}` : ''}` : `${st.target}${def.unit === 'sec' ? 's' : ' reps'}`;
     return `<li><span>${esc(def.name)}</span><span>${val}</span></li>`;
   }).join('');
   const done = state.history.filter((h) => !h.skipped);
   const last28 = done.filter((h) => Date.now() - new Date(h.date) < 28 * 86400000);
-  const cardioMin = last28.filter((h) => h.session.kind === 'cardio').reduce((a, h) => a + (Number(h.log?.minutes) || 0), 0);
+  const cardioMin = last28.reduce((a, h) => {
+    if (h.session.kind === 'cardio') return a + (Number(h.log?.minutes) || 0);
+    const fin = h.session.exercises.findIndex((ex) => ex.role === 'finisher');
+    return a + (fin >= 0 ? Number(h.log.exercises[fin].sets[0]?.reps) || 0 : 0);
+  }, 0);
   const hist = [...state.history].reverse().slice(0, 30).map((h) => `
     <li><details><summary><span>${fmtDate(h.date)}</span><span>${esc(h.session.title)}${h.skipped ? ' (skipped)' : ''}</span></summary>
     ${historyDetail(h)}</details></li>`).join('');
@@ -405,8 +448,15 @@ function progressView() {
     <h3>Consistency</h3>
     <ul class="kv"><li><span>Sessions, last 4 weeks</span><span>${last28.length}</span></li><li><span>Sessions, all time</span><span>${done.length}</span></li></ul>
   </section>
-  <section class="card"><h3>Accessories</h3><ul class="kv">${acc}</ul></section>
+  <section class="card"><h3>This block's accessories</h3><p class="muted small">These change every 4 weeks.</p><ul class="kv">${acc}</ul></section>
   <section class="card"><h3>History</h3>${hist ? `<ul class="history">${hist}</ul>` : '<p class="muted">Nothing logged yet.</p>'}</section>`;
+}
+
+function capLine(k, l) {
+  const cap = E.capFor(state.profile, k);
+  if (!cap) return '';
+  const best = l.atCap && l.atCap.weight === cap ? ` · best: ${l.atCap.reps} reps` : '';
+  return `<div class="muted small">Limit ${fmtW(cap)} ${units()}${best}</div>`;
 }
 
 function historyDetail(h) {
@@ -435,11 +485,18 @@ function settingsView() {
       <label>Units<select name="units">${opt(['lb', 'kg'], p.units)}</select></label>
       <label>Age<input type="number" name="age" value="${p.age}" min="14" max="90"></label>
       <label>Lifting days / week<select name="liftDays">${opt([2, 3, 4], p.liftDays)}</select></label>
-      <label>Cardio days / week<select name="cardioDays">${opt([0, 1, 2, 3], p.cardioDays)}</select></label>
+      <label>Cardio days / week<select name="cardioDays">${opt([0, 1, 2, 3, 4, 5], p.cardioDays)}</select></label>
       <label>Session length<select name="length">${opt(['standard', 'short'], p.length, { standard: 'Standard (~45 min)', short: 'Short (~30 min)' })}</select></label>
+      <label>Cardio after lifting<select name="finisher">${finisherOptions(p.finisher)}</select></label>
       <label>Longest Zone 2 (min)<input type="number" name="z2Max" value="${p.z2Max}" min="20" max="90" step="5"></label>
     </div>
     <button class="primary" type="submit">Save settings</button>
+  </form>
+  <form id="caps" class="card stack">
+    <h3>Weight limits (${units()})</h3>
+    <p class="muted small">At a limit, the weight holds and the target reps climb instead. Leave blank for no limit.</p>
+    ${capInputs(p.caps)}
+    <button class="primary" type="submit">Save limits</button>
   </form>
   <form id="maxes" class="card stack">
     <h3>Estimated maxes</h3>
@@ -455,12 +512,13 @@ function settingsView() {
   </section>
   <section class="card stack how">
     <h3>How it works</h3>
-    <p><strong>Blocks.</strong> Training runs in 4-week blocks: three weeks that get progressively heavier, then a lighter deload week. Blocks alternate between Build (more reps) and Strength (fewer, heavier reps).</p>
+    <p><strong>Blocks.</strong> Training runs in 4-week blocks: three weeks that get progressively heavier, then a lighter deload week. Blocks alternate between Build (sets of 8-10) and Strength (sets of 4-6).</p>
     <p><strong>RPE.</strong> After each set, rate how hard it was. RPE 8 means about 2 more reps were possible. Main lifts top out at RPE 8.5, so you train hard without grinding to failure.</p>
     <p><strong>Live adjustments.</strong> If your top set is harder than planned or you miss reps, the back-off sets drop right away. Two grinders in a row and the app tells you to stop that lift for the day.</p>
     <p><strong>Progression.</strong> Hit your targets and your estimated max goes up, so next week is heavier. Miss them and it eases off. Two rough sessions in a row on a lift triggers a 5% reset to rebuild momentum.</p>
-    <p><strong>Accessories</strong> use double progression: reach the top of the rep range on every set and the weight goes up.</p>
-    <p><strong>Cardio.</strong> Zone 2 sessions build your aerobic base, growing 5 minutes at a time up to your cap. Intervals climb a ladder up to the 4×4 protocol, one of the best-studied ways to raise VO2 max, a strong marker of longevity.</p>
+    <p><strong>Weight limits.</strong> Once a lift reaches the limit you set, the weight stays there. Getting stronger then shows up as more reps at that weight, up to 12 (10 for deadlifts), and the app tracks your rep records at each limit.</p>
+    <p><strong>Accessories</strong> rotate every 4-week block so things stay fresh. Each exercise gets a full block to progress, and its weight is remembered for when it comes back around. Tap Swap during a workout if the equipment is taken. They use double progression: reach the top of the rep range on every set and the weight goes up.</p>
+    <p><strong>Cardio.</strong> An optional easy finisher after lifting adds cardio without an extra trip to the gym. When it's on, accessory sets drop to 2 so the session stays short. Zone 2 sessions build your aerobic base, growing 5 minutes at a time up to your cap. Intervals climb a ladder up to the 4×4 protocol, one of the best-studied ways to raise VO2 max, a strong marker of longevity.</p>
     <p><strong>Check-ins.</strong> Poor sleep, low energy or soreness makes that day's session lighter. Missed two weeks? The first session back is eased too.</p>
     <p class="muted small">General fitness guidance, not medical advice. Check with a doctor before starting hard exercise if you have heart, blood pressure or joint concerns.</p>
   </section>
@@ -669,6 +727,17 @@ $app.addEventListener('click', (e) => {
     case 'log-set':
       logSet(i, j);
       break;
+    case 'swap': {
+      const { session, log } = state.active;
+      const swapped = E.swapAccessory(state, session, i);
+      if (!swapped) { toast('No other option in this group today.'); break; }
+      session.exercises[i] = swapped;
+      log.exercises[i] = { sets: swapped.sets.map(() => null) };
+      if (ui.editing?.ex === i) ui.editing = { ex: i, set: 0 };
+      persist();
+      render();
+      break;
+    }
     case 'clear-set':
       state.active.log.exercises[i].sets[j] = null;
       persist();
@@ -743,7 +812,7 @@ $app.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
   try {
-    const data = await importFile(file);
+    const data = E.migrateState(await importFile(file));
     if (state && !confirm('Replace your current data with this backup?')) return;
     tab = 'today';
     commit(data);
@@ -764,7 +833,9 @@ $app.addEventListener('submit', (e) => {
       liftDays: Number(f.get('liftDays')),
       cardioDays: Number(f.get('cardioDays')),
       length: f.get('length'),
+      finisher: Number(f.get('finisher')),
       z2Start: Math.max(10, Number(f.get('z2Start')) || 20),
+      caps: readCaps(f),
     };
     profile.z2Max = Math.max(profile.z2Max, profile.z2Start);
     const inputs = {};
@@ -780,10 +851,14 @@ $app.addEventListener('submit', (e) => {
       liftDays: Number(f.get('liftDays')),
       cardioDays: Number(f.get('cardioDays')),
       length: f.get('length'),
-      z2Max: Math.max(15, Number(f.get('z2Max')) || 45),
+      finisher: Number(f.get('finisher')),
+      z2Max: Math.max(15, Number(f.get('z2Max')) || 60),
     });
     commit(next);
     toast('Settings saved.');
+  } else if (e.target.id === 'caps') {
+    commit(E.applyProfileChange(state, { caps: readCaps(f) }));
+    toast('Weight limits saved.');
   } else if (e.target.id === 'maxes') {
     const next = structuredClone(state);
     for (const k of Object.keys(E.MAIN_LIFTS)) {

@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import {
   percentOf1RM, estimate1RM, warmupSets, roundBarbell,
   createState, defaultProfile, weekPlan, buildSession, emptyLog, adjustAfterSet,
-  completeSession, projectUpcoming, advanceCursor, readinessLevel, applyProfileChange,
+  completeSession, projectUpcoming, migrateState, swapAccessory, accessoriesForBlock, repsAtLoad, capFor,
+  ACCESSORY_POOLS, ACCESSORIES, TEMPLATES, advanceCursor, readinessLevel, applyProfileChange,
   progressCardio, buildCardioSession, heartRateZones, INTERVAL_LADDER,
 } from '../js/engine/index.js';
 
@@ -14,8 +15,11 @@ const inputs = {
   press: { weight: 125, reps: 5, rpe: 8 },
 };
 
+// Baseline without caps or finisher so the core progression is tested on its own.
+const BASE = { cardioDays: 2, finisher: 0, caps: {} };
+
 function fresh(overrides = {}) {
-  return createState({ ...defaultProfile(), ...overrides }, inputs, new Date('2026-01-05'));
+  return createState({ ...defaultProfile(), ...BASE, ...overrides }, inputs, new Date('2026-01-05'));
 }
 
 // Log every planned set exactly as prescribed, at a given RPE offset.
@@ -166,8 +170,8 @@ test('accessory double progression', () => {
   const w = st.accessories.row.weight;
   ({ state: st } = completeSession(st, s, logAsPlanned(s)));
   assert.equal(st.accessories.row.weight, w + 5);
-  const plankBefore = fresh().accessories.plank.target;
-  assert.equal(st.accessories.plank.target, plankBefore + 5);
+  const pullApart = fresh().accessories.pullApart.target;
+  assert.equal(st.accessories.pullApart.target, pullApart, 'pull-apart not in this session, unchanged');
   assert.ok(i >= 0);
 });
 
@@ -217,4 +221,103 @@ test('switching units converts weights', () => {
   assert.equal(kg.accessories.row.weight % 2.5, 0);
   const s = buildSession(kg);
   assert.equal(s.exercises[0].sets[0].weight % 2.5, 0);
+});
+
+test('weight caps hold the load and progress reps instead', () => {
+  const caps = { squat: 315, bench: 225, deadlift: 405, press: 135 };
+  // Strong lifter: uncapped plans would exceed every cap.
+  const strong = { squat: { weight: 365, reps: 5, rpe: 8 }, bench: { weight: 265, reps: 5, rpe: 8 }, deadlift: { weight: 455, reps: 5, rpe: 8 }, press: { weight: 165, reps: 5, rpe: 8 } };
+  let st = createState({ ...defaultProfile(), ...BASE, caps }, strong);
+  // Build-block sets of 10 sit under the cap; the Strength block reaches it.
+  assert.equal(buildSession(st).exercises[0].capped, false);
+  st.cursor = { block: 1, week: 1, slot: 0 };
+  const s = buildSession(st);
+  const main = s.exercises[0];
+  assert.equal(main.capped, true);
+  assert.equal(main.sets[0].weight, 315);
+  assert.ok(main.sets[0].reps > 6, 'reps go above the planned 6 when the weight is capped');
+  for (const set of main.sets) assert.ok(set.weight <= 315);
+
+  // Nothing in the projection ever goes over a cap.
+  for (const u of projectUpcoming(st, 40)) {
+    if (u.session.kind !== 'lift') continue;
+    for (const ex of u.session.exercises) {
+      if (!ex.lift) continue;
+      for (const set of ex.sets) assert.ok(set.weight <= caps[ex.lift], `${ex.lift} ${set.weight}`);
+      for (const w of ex.warmup || []) assert.ok(w.weight <= caps[ex.lift]);
+    }
+  }
+
+  // Hitting targets at the cap leads to more reps next time, and a rep record note.
+  const before = main.sets[0].reps;
+  let notes;
+  ({ state: st, notes } = completeSession(st, s, logAsPlanned(s)));
+  assert.match(notes[0], /reps at your 315 cap/);
+  st.cursor = { block: 1, week: 1, slot: 0 };
+  for (let k = 0; k < 4; k++) st.lifts.squat.e1rm *= 1.01;
+  assert.ok(buildSession(st).exercises[0].sets[0].reps > before);
+  assert.equal(st.lifts.squat.atCap.reps, before);
+});
+
+test('reps at cap respect the ceiling and the plan minimum', () => {
+  assert.equal(repsAtLoad(1000, 315, 8, 4, 12), 12);
+  assert.equal(repsAtLoad(330, 315, 8, 4, 12), 4);
+  assert.equal(capFor({ units: 'lb', caps: { squat: 317 } }, 'squat'), 315);
+  assert.equal(capFor({ units: 'lb', caps: { squat: 0 } }, 'squat'), null);
+});
+
+test('accessories rotate each block and avoid core work', () => {
+  const profile = { ...defaultProfile(), liftDays: 3 };
+  const b0 = accessoriesForBlock(profile, 0);
+  const b1 = accessoriesForBlock(profile, 1);
+  assert.notDeepEqual(b0, b1);
+  for (const pool of Object.values(ACCESSORY_POOLS)) for (const id of pool) assert.ok(ACCESSORIES[id], id);
+  assert.ok(!ACCESSORIES.plank && !ACCESSORIES.deadBug);
+  for (const days of Object.values(TEMPLATES)) for (const t of days) for (const c of t.accessories) assert.ok(ACCESSORY_POOLS[c], c);
+  // Same category on two days in one block gets different exercises.
+  const st = fresh();
+  const a = buildSession(st, { type: 'lift', day: 0 });
+  const c = buildSession(st, { type: 'lift', day: 2 });
+  assert.notEqual(a.exercises.find((e) => e.category === 'hRow').acc, c.exercises.find((e) => e.category === 'hRow').acc);
+});
+
+test('swap gives a different accessory from the same category', () => {
+  const st = fresh();
+  const s = buildSession(st);
+  const i = s.exercises.findIndex((e) => e.role === 'accessory');
+  const swapped = swapAccessory(st, s, i);
+  assert.equal(swapped.category, s.exercises[i].category);
+  assert.notEqual(swapped.acc, s.exercises[i].acc);
+  assert.equal(swapped.sets.length, s.exercises[i].sets.length);
+});
+
+test('cardio finisher is added, logged, and keeps the session short', () => {
+  let st = fresh({ finisher: 10 });
+  const s = buildSession(st);
+  const fin = s.exercises.at(-1);
+  assert.equal(fin.role, 'finisher');
+  assert.equal(fin.sets[0].reps, 10);
+  assert.ok(s.minutes <= 50, `${s.minutes}`);
+  ({ state: st } = completeSession(st, s, logAsPlanned(s)));
+  assert.equal(st.history.length, 1);
+  assert.equal(weekPlan({ liftDays: 3, cardioDays: 4 }, 1).filter((p) => p.type === 'cardio').length, 4);
+});
+
+test('old saved data migrates without losing progress', () => {
+  const old = fresh();
+  old.version = 1;
+  delete old.profile.caps;
+  delete old.profile.finisher;
+  old.profile.z2Max = 45;
+  delete old.accessories.chestRow;
+  old.lifts.squat.e1rm = 333;
+  old.active = { session: {}, log: {} };
+  const m = migrateState(old);
+  assert.deepEqual(m.profile.caps, { squat: 315, bench: 225, deadlift: 405, press: 135 });
+  assert.equal(m.profile.finisher, 10);
+  assert.equal(m.profile.z2Max, 60);
+  assert.ok(m.accessories.chestRow);
+  assert.equal(m.lifts.squat.e1rm, 333);
+  assert.equal(m.active, null);
+  assert.equal(migrateState(m).profile.z2Max, 60);
 });
