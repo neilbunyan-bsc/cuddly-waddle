@@ -15,24 +15,6 @@
   color-scheme: dark;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    --bg: #f4f6f8;
-    --surface: #ffffff;
-    --surface-2: #eef1f4;
-    --line: #dce2e8;
-    --text: #15202b;
-    --muted: #5f6c78;
-    --accent: #0f9d74;
-    --accent-ink: #ffffff;
-    --main: #c26a00;
-    --warn: #8a5a00;
-    --bad: #c93636;
-    --hard: #d62f2f;
-    color-scheme: light;
-  }
-}
-
 * { box-sizing: border-box; }
 
 html, body {

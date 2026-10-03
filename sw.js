@@ -1,5 +1,5 @@
 // Offline support: cache the app shell, serve cache-first, refresh in the background.
-const CACHE = 'steady-strong-v2';
+const CACHE = 'steady-strong-v3';
 const ASSETS = [
   './',
   'index.html',
